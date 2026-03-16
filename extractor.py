@@ -249,6 +249,34 @@ def extract_stream_links_from_page(html):
     return found
 
 
+def extract_step_links_from_lesson_page(html, current_lesson_url=None):
+    """Из страницы урока вытаскивает ссылки на шаги, полностью игнорируя "Описание"."""
+    soup = BeautifulSoup(html, "html.parser")
+    found = []
+
+    for li in soup.select(".lesson-list li"):
+        a = li.select_one("a[href*='lesson/view']")
+        if not a:
+            continue
+
+        title_el = li.select_one(".link.title")
+        title_text = title_el.get_text(" ", strip=True).lower() if title_el else ""
+        if "описание" in title_text:
+            continue
+
+        href = a.get("href")
+        if not href:
+            continue
+
+        full = urljoin(BASE, href)
+        if full == current_lesson_url:
+            continue
+        if full not in found:
+            found.append(full)
+
+    return found
+
+
 def lesson_id_from_url(u):
     m = re.search(r"(?:lesson/view/id/|lesson/view\?id=)(\d+)", u)
     if m:
@@ -265,7 +293,7 @@ def pl_lesson_url_from_lesson_url(lesson_url):
     return lesson_url
 
 
-def process_lesson_page(page, lesson_url, out_base_dir):
+def process_lesson_page(page, lesson_url, out_base_dir, follow_next=True):
     """
     Открывает pl-версию урока, собирает все шаги, сохраняет их.
     Возвращает количество сохранённых шагов.
@@ -309,6 +337,9 @@ def process_lesson_page(page, lesson_url, out_base_dir):
             print(f"     ! Ошибка при сохранении шага {current_id}: {e}")
 
         # ищем следующий шаг
+        if not follow_next:
+            break
+
         next_id = find_next_step_id(soup)
         if not next_id:
             break
@@ -417,12 +448,23 @@ def main():
                     print("   ! Ошибка загрузки урока:", e)
                     continue
 
-                # теперь обработаем pl-версию урока — внутри нее есть шаги
-                saved = process_lesson_page(page, lesson_url, module_dir)
-                if saved == 0:
-                    print("   ! Не найден шаг для этого урока, пропускаю.")
+                lesson_html = page.content()
+                step_links = extract_step_links_from_lesson_page(lesson_html, lesson_url)
+                if not step_links:
+                    print("   ! Шаги не найдены (описание принудительно игнорируется), пропускаю урок.")
+                    continue
+
+                print(f"   Найдено шагов в уроке: {len(step_links)}")
+
+                total_saved = 0
+                for step_link in step_links:
+                    saved = process_lesson_page(page, step_link, module_dir, follow_next=False)
+                    total_saved += saved
+
+                if total_saved == 0:
+                    print("   ! Шаги найдены, но не удалось сохранить контент.")
                 else:
-                    print(f"   Урок обработан: saved steps = {saved}")
+                    print(f"   Урок обработан: saved steps = {total_saved}")
 
         # финальное сохранение state (на всякий)
         try:
