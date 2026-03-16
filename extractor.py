@@ -185,37 +185,61 @@ def parse_page_and_save(html, out_dir, step_id):
     return lesson_title, md_path, saved_image_paths
 
 
-def find_next_step_id(soup):
-    """Ищет ссылку 'Следующий урок' (или похожую) и возвращает id как int или None."""
-    # сначала прямой поиск по тексту
-    a = soup.find("a", href=True, string=lambda s: s and "Следующий урок" in s)
-    if not a:
-        # иногда текст разбит спанами — проверим все ссылки с pattern lesson/view?id=
-        for link in soup.select("a[href*='lesson/view?id=']"):
-            if "следующ" in link.get_text(strip=True).lower() or "next" in link.get_text(strip=True).lower():
-                a = link
-                break
-    if not a:
-        # попробуем найти ссылку с href /pl/teach/control/lesson/view?id=NNN внутри any <a>
-        for link in soup.select("a[href*='lesson/view?id=']"):
-            href = link.get("href", "")
-            if "id=" in href:
-                # но не уверены, что это next — всё равно вернём первый попавшийся (fallback)
-                try:
-                    return int(href.split("id=")[-1])
-                except:
-                    pass
+def find_next_step_url(page_html):
+    """
+    Ищет кнопку 'Следующий урок' на странице шага и возвращает полный URL следующего шага.
+    Если кнопки нет — возвращает None.
+    """
+    soup = BeautifulSoup(page_html, "html.parser")
+    
+    # Ищем ссылку с текстом "Следующий урок" в блоке навигации
+    nav_block = soup.select_one(".lesson-navigation")
+    if not nav_block:
         return None
-    href = a["href"]
-    if "id=" in href:
-        try:
-            return int(href.split("id=")[-1])
-        except:
-            return None
-    # если путь вида /pl/teach/control/lesson/view/340313846 (редко) — достанем число
-    m = re.search(r"/(\d+)", href)
-    if m:
-        return int(m.group(1))
+    
+    # Ищем ссылку содержащую "Следующий урок"
+    next_link = None
+    for a in nav_block.select("a[href*='lesson/view']"):
+        text = a.get_text(strip=True).lower()
+        if "следующий урок" in text or "следующий" in text:
+            next_link = a
+            break
+    
+    if not next_link:
+        return None
+    
+    href = next_link.get("href")
+    if not href:
+        return None
+    
+    # Нормализуем URL
+    full_url = urljoin(BASE, href)
+    return full_url
+
+
+def get_first_step_url_from_lesson_page(html):
+    """
+    Из страницы урока (список шагов) получает URL первого шага.
+    Игнорирует элемент "Описание".
+    Возвращает первый доступный шаг или None.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    
+    for li in soup.select(".lesson-list li"):
+        a = li.select_one("a[href*='lesson/view']")
+        if not a:
+            continue
+        
+        # Пропускаем "Описание"
+        title_el = li.select_one(".link.title")
+        title_text = title_el.get_text(" ", strip=True).lower() if title_el else ""
+        if "описание" in title_text:
+            continue
+        
+        href = a.get("href")
+        if href:
+            return urljoin(BASE, href)
+    
     return None
 
 
@@ -293,67 +317,94 @@ def pl_lesson_url_from_lesson_url(lesson_url):
     return lesson_url
 
 
-def process_lesson_page(page, lesson_url, out_base_dir, follow_next=True):
+def process_lesson_with_navigation(page, lesson_url, lesson_dir):
     """
-    Открывает pl-версию урока, собирает все шаги, сохраняет их.
+    Обрабатывает урок с навигацией по шагам через кнопку 'Следующий урок'.
+    
+    Логика:
+    1. Заходим на страницу урока (список шагов)
+    2. Берём первый шаг (игнорируя 'Описание')
+    3. Парсим шаг, сохраняем данные
+    4. Ищем кнопку 'Следующий урок' на странице шага
+    5. Если есть — переходим по ней, повторяем с п.3
+    6. Если нет — завершаем обработку урока
+    
     Возвращает количество сохранённых шагов.
     """
-    pl_url = pl_lesson_url_from_lesson_url(lesson_url)
-    print("    -> Открываю шаг:", pl_url)
+    print(f"  -> Открываю урок: {lesson_url}")
+    
+    # Заходим на страницу урока (список шагов)
     try:
-        page.goto(pl_url, timeout=30000)
+        page.goto(lesson_url, timeout=20000)
+        time.sleep(1)
     except Exception as e:
-        print("     ! Ошибка загрузки pl-страницы:", e)
+        print(f"   ! Ошибка загрузки урока: {e}")
         return 0
-
-    visited = set()
-    saved_count = 0
-    nav_count = 0
-    current_id = lesson_id_from_url(pl_url)
-
-    while current_id and nav_count < MAX_STEP_NAV:
-        nav_count += 1
-        if current_id in visited:
-            print("     loop detected, stop.")
+    
+    lesson_html = page.content()
+    
+    # Получаем URL первого шага
+    first_step_url = get_first_step_url_from_lesson_page(lesson_html)
+    if not first_step_url:
+        print("   ! Шаги не найдены (описание игнорируется), пропускаю урок.")
+        return 0
+    
+    # Собираем все шаги через навигацию
+    step_urls = [first_step_url]
+    visited_steps = {first_step_url}
+    
+    # Навигация по шагам через кнопку "Следующий урок"
+    max_steps = MAX_STEP_NAV
+    current_step_url = first_step_url
+    
+    for i in range(max_steps):
+        # Переходим на текущий шаг (pl-версия)
+        pl_url = pl_lesson_url_from_lesson_url(current_step_url)
+        print(f"   -> Шаг {i+1}: {pl_url}")
+        
+        try:
+            page.goto(pl_url, timeout=30000)
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"     ! Ошибка загрузки шага: {e}")
             break
-        visited.add(current_id)
-
-        # убеждаемся, что страница действительно step/pl-lesson
-        html = page.content()
-        soup = BeautifulSoup(html, "html.parser")
+        
+        step_html = page.content()
+        
+        # Проверяем, есть ли контент шага
+        soup = BeautifulSoup(step_html, "html.parser")
         if not soup.select_one(".lite-block-live-wrapper"):
-            # нет блоков шага — скорее всего это страница "Описание" или просто не тот формат
-            print(f"     ! Не найден шаг на странице урока {current_id}.")
-            return saved_count
-
-        # сохраняем
-        lesson_dir = os.path.join(out_base_dir, f"lesson_{lesson_id_from_url(lesson_url)}")
-        ensure_dir(lesson_dir)
-        try:
-            title, md_path, images = parse_page_and_save(html, lesson_dir, current_id)
-            print(f"     saved step {current_id} (images: {len(images)})")
-            saved_count += 1
-        except Exception as e:
-            print(f"     ! Ошибка при сохранении шага {current_id}: {e}")
-
-        # ищем следующий шаг
-        if not follow_next:
+            print(f"     ! Не найден контент шага на странице {pl_url}.")
             break
-
-        next_id = find_next_step_id(soup)
-        if not next_id:
+        
+        # Сохраняем шаг
+        step_id = lesson_id_from_url(pl_url)
+        if step_id:
+            ensure_dir(lesson_dir)
+            ensure_dir(os.path.join(lesson_dir, "images"))
+            try:
+                title, md_path, images = parse_page_and_save(step_html, lesson_dir, step_id)
+                print(f"     saved step {step_id} (title: {title}, images: {len(images)})")
+            except Exception as e:
+                print(f"     ! Ошибка при сохранении шага {step_id}: {e}")
+        
+        # Ищем кнопку "Следующий урок"
+        next_step_url = find_next_step_url(step_html)
+        
+        if not next_step_url:
+            print("   Кнопка 'Следующий урок' не найдена — завершаем навигацию по шагам.")
             break
-
-        # навигация: откроем страницу следующего шага (pl URL)
-        next_pl = f"{BASE}/pl/teach/control/lesson/view?id={next_id}"
-        try:
-            page.goto(next_pl, timeout=20000)
-        except Exception as e:
-            print("     ! Ошибка перехода к следующему шагу:", e)
+        
+        # Проверяем, не зациклились ли мы
+        if next_step_url in visited_steps:
+            print("   Обнаружен цикл навигации — завершаем.")
             break
-        current_id = next_id
-
-    return saved_count
+        
+        visited_steps.add(next_step_url)
+        step_urls.append(next_step_url)
+        current_step_url = next_step_url
+    
+    return len(step_urls)
 
 
 def main():
@@ -441,25 +492,15 @@ def main():
             # обрабатываем каждый урок
             for lesson_url in lesson_links:
                 lid = lesson_id_from_url(lesson_url) or "unknown"
-                print(f"  -> Открываю урок: {lesson_url}")
-                try:
-                    page.goto(lesson_url, timeout=20000)
-                except Exception as e:
-                    print("   ! Ошибка загрузки урока:", e)
-                    continue
-
-                lesson_html = page.content()
-                step_links = extract_step_links_from_lesson_page(lesson_html, lesson_url)
-                if not step_links:
-                    print("   ! Шаги не найдены (описание принудительно игнорируется), пропускаю урок.")
-                    continue
-
-                print(f"   Найдено шагов в уроке: {len(step_links)}")
-
-                total_saved = 0
-                for step_link in step_links:
-                    saved = process_lesson_page(page, step_link, module_dir, follow_next=False)
-                    total_saved += saved
+                
+                # создаём подпапку для этого урока внутри модуля
+                lesson_lid = lesson_id_from_url(lesson_url) or "unknown"
+                lesson_dir = os.path.join(module_dir, f"lesson_{lesson_lid}")
+                ensure_dir(lesson_dir)
+                ensure_dir(os.path.join(lesson_dir, "images"))
+                
+                # Используем новую функцию с навигацией по кнопке "Следующий урок"
+                total_saved = process_lesson_with_navigation(page, lesson_url, lesson_dir)
 
                 if total_saved == 0:
                     print("   ! Шаги найдены, но не удалось сохранить контент.")
